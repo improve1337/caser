@@ -5,7 +5,7 @@ local TweenService = game:GetService("TweenService")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-local SCRIPT_URL = "https://raw.githubusercontent.com/bobloscript/robscript/refs/heads/main/Caser"
+local SCRIPT_URL = "https://raw.githubusercontent.com/improve1337/caser/main/Caser"
 
 -- Удаляем старую заставку
 local oldGui = PlayerGui:FindFirstChild("CaserLoading")
