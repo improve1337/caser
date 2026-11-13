@@ -1,0 +1,1924 @@
+--[[
+pushLog("<Success>Robscript Team - Caser loaded</Success> - RightControl toggles the window")
+=====================================================================
+  CASER - Case Farm Hub (Potassium / Robly Airflow UI)
+  v1.0 - auto case opening with rotation, inventory selling by filters
+=====================================================================
+  Game: CASER - Open Cases & Upgrade Your Skins!
+  placeId 136751105840706
+
+  How the game talks
+    * every action is one call on ReplicatedStorage.Caser.Request (a RemoteFunction)
+    * open : Request:InvokeServer("open", { case = id, count = n, turbo = bool, free = bool })
+             -> { ok = true, items = { { uid, item, case, dropChance } ... }, profile = ... }
+    * sell : Request:InvokeServer("sell", { ids = { uid, ... } }) -> { ok = true, value = n, profile = ... }
+    * state: Request:InvokeServer("state", {}) -> credits, freeOpens, vip, ...
+
+  Rules the server enforces (measured live)
+    * 1..6 cases per call; VIP or the PRESET PASS unlocks 1..10
+    * ~1 s lock between two successful opens ("Please wait for the current action to finish")
+    * 500 items max in the inventory ("Inventory full. Sell some items first.")
+    * the free case needs free opens from rank rewards, the VIP case needs VIP + a 2 h cooldown
+
+  Tabs
+    * Cases   - auto open, cases per call, rotation queue ("case x N opens")
+    * Selling - rarity / kind / weapon / price filters, auto sell, inventory guard
+    * Logs    - what the script is doing
+    * Info    - protocol notes, session numbers
+
+  Window: RightControl
+  API:    getgenv().CaserHub
+=====================================================================
+--]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+-- Unload a previous copy first, so its loops and listeners die before ours appear.
+do
+	local previous = getgenv().CaserHub
+	if previous and type(previous.destroy) == "function" then
+		pcall(previous.destroy)
+	end
+end
+
+----- UI library -----
+
+local Airflow = getgenv().__CaserHubLibrary
+if type(Airflow) ~= "table" or type(Airflow.CreateWindow) ~= "function" then
+	Airflow = nil
+	for _, url in ipairs(LIBRARY_URLS) do
+		local ok, result = pcall(function()
+			return loadstring(game:HttpGet(url))()
+		end)
+		if ok and type(result) == "table" and type(result.CreateWindow) == "function" then
+			Airflow = result
+			break
+		end
+		warn("[CaserHub] UI library failed from " .. url .. ": " .. tostring(result))
+	end
+end
+if not Airflow then
+	error("[CaserHub] could not load the Robly Airflow UI library")
+end
+getgenv().__CaserHubLibrary = Airflow
+
+----- Game handles -----
+
+local Caser = ReplicatedStorage:WaitForChild("Caser", 30)
+if not Caser then
+	error("[CaserHub] ReplicatedStorage.Caser is missing - this is not the CASER game")
+end
+
+local Request = Caser:WaitForChild("Request", 30)
+if not Request then
+	error("[CaserHub] Caser.Request never appeared")
+end
+
+local Catalog
+do
+	local ok, module = pcall(require, Caser:WaitForChild("Catalog", 20))
+	if ok and type(module) == "table" then
+		Catalog = module
+	end
+end
+if not Catalog then
+	error("[CaserHub] the case catalog could not be read")
+end
+
+local Economy
+do
+	local ok, module = pcall(require, Caser:WaitForChild("Economy", 20))
+	if ok and type(module) == "table" then
+		Economy = module
+	end
+end
+
+----- Constants -----
+
+local SELL_CHUNK = 200 -- ids per "sell" call
+local OPEN_LOCK = 1.25 -- measured server-side pause between two actions (open and sell share it)
+local BUSY_TEXT = "wait for the current action"
+local INVENTORY_MAX = tonumber(Catalog.MaxInventory) or 500
+
+local RARITY_LABELS = {
+	[1] = "1 - Mil-Spec",
+	[2] = "2 - Restricted",
+	[3] = "3 - Classified",
+	[4] = "4 - Covert",
+	[5] = "5 - Exceedingly rare",
+}
+
+local RARITY_INDEX = {
+	["1 - Mil-Spec"] = 1,
+	["2 - Restricted"] = 2,
+	["3 - Classified"] = 3,
+	["4 - Covert"] = 4,
+	["5 - Exceedingly rare"] = 5,
+}
+
+local KIND_ORDER = { "gun", "knife", "gloves", "agent", "sticker", "patch", "charm", "music" }
+local KIND_LABELS = {
+	gun = "Guns",
+	knife = "Knives",
+	gloves = "Gloves",
+	agent = "Agents",
+	sticker = "Stickers",
+	patch = "Patches",
+	charm = "Charms",
+	music = "Music kits",
+}
+local KIND_INDEX = {}
+for kind, label in pairs(KIND_LABELS) do
+	KIND_INDEX[label] = kind
+end
+
+local KIND_OPTIONS = {}
+for _, kind in ipairs(KIND_ORDER) do
+	table.insert(KIND_OPTIONS, KIND_LABELS[kind])
+end
+
+local RARITY_OPTIONS = {}
+for index = 1, 5 do
+	table.insert(RARITY_OPTIONS, RARITY_LABELS[index])
+end
+
+----- Formatting helpers -----
+
+-- The game prints money as credits / 100 ("1 805.07" for 180507 credits, see Economy.money),
+-- with a space every three digits and no ".00" tail. Every number the user sees in this hub
+-- goes through the same two functions, so the hub and the game never disagree.
+local MONEY_UNIT = 100
+
+local function gameMoney(value)
+	value = tonumber(value) or 0
+	local formatted = string.format("%.2f", math.abs(value) / MONEY_UNIT)
+	local whole, cents = string.match(formatted, "^(%d+)%.(%d+)$")
+	if not whole then
+		return formatted
+	end
+	whole = string.reverse(string.reverse(whole):gsub("(%d%d%d)", "%1 ")):gsub("^%s", "")
+	local negative = value < 0 and (whole ~= "0" or cents ~= "00")
+	return (negative and "-" or "") .. whole .. (cents == "00" and "" or "." .. cents)
+end
+
+local function money(value)
+	return gameMoney(value) .. " ◈"
+end
+
+-- Sliders are shown in the same units the game uses (credits / 100), the API stays in credits.
+local function unitsToCredits(units)
+	return (tonumber(units) or 0) * MONEY_UNIT
+end
+
+local function formatNumber(value)
+	value = tonumber(value) or 0
+	local sign = value < 0 and "-" or ""
+	value = math.abs(value)
+	if value >= 1e9 then
+		return string.format("%s%.2fb", sign, value / 1e9)
+	elseif value >= 1e6 then
+		return string.format("%s%.2fm", sign, value / 1e6)
+	elseif value >= 1e3 then
+		return string.format("%s%.1fk", sign, value / 1e3)
+	end
+	return sign .. tostring(math.floor(value))
+end
+
+local function shortTime(seconds)
+	seconds = math.max(0, math.floor(tonumber(seconds) or 0))
+	if seconds >= 3600 then
+		return string.format("%dh %02dm", math.floor(seconds / 3600), math.floor(seconds % 3600 / 60))
+	elseif seconds >= 60 then
+		return string.format("%dm %02ds", math.floor(seconds / 60), seconds % 60)
+	end
+	return string.format("%ds", seconds)
+end
+
+----- Shared state -----
+
+local State = {
+	profile = nil,
+	vip = false,
+	serverTime = nil,
+	running = false,
+	token = 0,
+	selling = false,
+	opening = false,
+	lastOpenAt = 0,
+	lastActionAt = 0,
+	opensSinceSell = 0,
+	rotationIndex = 1,
+	rotationOpened = 0,
+	skipped = {},
+	noFree = {},
+	noFreeHits = {},
+	caseCooldown = {},
+	skipReason = "",
+	notice = nil,
+	lastLoopAt = 0,
+	lastSellAttempt = 0,
+	lastDrop = nil,
+	stats = {
+		opens = 0,
+		cases = 0,
+		invested = 0,
+		dropped = 0,
+		sold = 0,
+		earned = 0,
+		best = 0,
+		bestName = "",
+	},
+}
+
+local ui = {}
+local LogElement = nil
+
+local function pushLog(text)
+	if LogElement then
+		pcall(function()
+			LogElement:Push(tostring(text))
+		end)
+	end
+end
+
+local function notify(title, content, kind)
+	pcall(function()
+		Window:Notify({ Title = title, Content = content, Duration = 4, Type = kind or "Info" })
+	end)
+end
+
+-- Elements expose :Get(); some also keep .Value. Read through both, never trust one shape.
+local function valueOf(element, fallback)
+	if not element then
+		return fallback
+	end
+	local ok, value = pcall(function()
+		return element:Get()
+	end)
+	if ok and value ~= nil then
+		return value
+	end
+	local raw = element.Value
+	if raw ~= nil then
+		return raw
+	end
+	return fallback
+end
+
+local function toggleOf(element)
+	return valueOf(element, false) == true
+end
+
+-- Declared here because saveSaved below needs them; filled in by buildCaseList.
+local CaseList = {}
+local CaseByLabel = {}
+local LabelById = {}
+
+----- Saved settings -----
+
+-- The Airflow window flags survive only while the script runs, and the rotation queue is not
+-- a flag at all, so the queue and the filters are kept in a small JSON file next to the script.
+local CONFIG_FILE = "RobscriptTeamCaser.json"
+local HttpService = game:GetService("HttpService")
+local Saved = {}
+
+local function loadSaved()
+	if type(readfile) ~= "function" or type(isfile) ~= "function" then
+		return
+	end
+	local ok, raw = pcall(function()
+		if not isfile(CONFIG_FILE) then
+			return nil
+		end
+		return readfile(CONFIG_FILE)
+	end)
+	if not ok or type(raw) ~= "string" or raw == "" then
+		return
+	end
+	local decoded
+	ok, decoded = pcall(function()
+		return HttpService:JSONDecode(raw)
+	end)
+	if ok and type(decoded) == "table" then
+		Saved = decoded
+	end
+end
+
+local function saveSaved()
+	if type(writefile) ~= "function" then
+		return
+	end
+	local rows = {}
+	if ui.rotationTable then
+		local ok, current = pcall(function()
+			return ui.rotationTable:Get()
+		end)
+		if ok and type(current) == "table" then
+			for _, row in ipairs(current) do
+				if type(row) == "table" then
+					local label = row.Case or row[1]
+					local entry = CaseByLabel[label]
+					table.insert(rows, {
+						Case = label,
+						Id = entry and entry.id or row.Id or nil,
+						Opens = row.Opens or row[2],
+					})
+				end
+			end
+		end
+	end
+	local data = {
+		rows = rows,
+		rotate = ui.rotateCases and toggleOf(ui.rotateCases) or nil,
+		single = valueOf(ui.caseDropdown, nil),
+		perOpen = valueOf(ui.casesPerOpen, nil),
+		sellEvery = valueOf(ui.sellEvery, nil),
+		autoSell = ui.autoSell and toggleOf(ui.autoSell) or nil,
+		forceSellAt = valueOf(ui.forceSellAt, nil),
+		minValueU = valueOf(ui.minValue, nil),
+		maxValueU = valueOf(ui.maxValue, nil),
+		rarities = valueOf(ui.rarityDropdown, nil),
+		kinds = valueOf(ui.kindDropdown, nil),
+		keywords = valueOf(ui.keywordInput, nil),
+		reserveU = valueOf(ui.reserve, nil),
+	}
+	local ok, encoded = pcall(function()
+		return HttpService:JSONEncode(data)
+	end)
+	if not ok then
+		State.lastSaveError = tostring(encoded)
+		return
+	end
+	local wrote, writeError = pcall(function()
+		writefile(CONFIG_FILE, encoded)
+	end)
+	if wrote then
+		State.lastSaveError = nil
+		State.lastSavedAt = os.clock()
+	else
+		State.lastSaveError = tostring(writeError)
+	end
+end
+
+loadSaved()
+
+----- Profile access -----
+
+local function acceptState(response)
+	if type(response) ~= "table" then
+		return
+	end
+	if type(response.profile) == "table" then
+		State.profile = response.profile
+	end
+	if response.vip ~= nil then
+		State.vip = response.vip == true
+	end
+	if tonumber(response.serverTime) then
+		State.serverTime = tonumber(response.serverTime)
+	end
+end
+
+local function credits()
+	local profile = State.profile
+	return profile and tonumber(profile.credits) or 0
+end
+
+local function inventory()
+	local profile = State.profile
+	if profile and type(profile.items) == "table" then
+		return profile.items
+	end
+	return {}
+end
+
+local function freeOpensFor(caseId)
+	local profile = State.profile
+	local map = profile and profile.freeOpens
+	if type(map) == "table" then
+		return tonumber(map[caseId]) or 0
+	end
+	return 0
+end
+
+local function presetUnlocked()
+	if not Economy or type(Economy.manyOpen) ~= "function" then
+		return false
+	end
+	local ok, result = pcall(Economy.manyOpen, State.profile)
+	return ok and result == true
+end
+
+-- 6 without VIP, 10 with VIP or the preset pass. The server is the real judge; this is the UI side.
+local function maxOpenPerCall()
+	if State.vip or presetUnlocked() then
+		return 10
+	end
+	return 6
+end
+
+local callRemote -- forward declaration, the action layer below fills it in
+
+local function refreshState()
+	if not callRemote then
+		return false
+	end
+	local response = callRemote("state", {}, 4)
+	if type(response) == "table" then
+		acceptState(response)
+		return true
+	end
+	return false
+end
+
+----- Case catalog view -----
+
+
+local function casePriceText(case)
+	if case.vip then
+		return "VIP"
+	elseif case.free then
+		return "free"
+	elseif (tonumber(case.price) or 0) > 0 then
+		return money(case.price)
+	end
+	return "free"
+end
+
+local function buildCaseList()
+	CaseList = {}
+	CaseByLabel = {}
+	LabelById = {}
+
+	local now = State.serverTime
+	local paid, special = {}, {}
+
+	for _, case in ipairs(Catalog.Cases) do
+		local pool = type(case.pool) == "table" and #case.pool or 0
+		local ended = now and case.endsAt and case.endsAt <= now
+		if pool > 0 and not ended then
+			local label = string.format("%s - %s", tostring(case.name), casePriceText(case))
+			if CaseByLabel[label] then
+				label = label .. " (" .. tostring(case.id) .. ")"
+			end
+			local entry = { label = label, case = case, id = case.id, price = tonumber(case.price) or 0 }
+			CaseByLabel[label] = entry
+			LabelById[entry.id] = label
+			table.insert(CaseList, entry)
+			if case.free or case.vip then
+				table.insert(special, entry)
+			else
+				table.insert(paid, entry)
+			end
+		end
+	end
+
+	table.sort(paid, function(left, right)
+		if left.price == right.price then
+			return left.label < right.label
+		end
+		return left.price < right.price
+	end)
+	table.sort(special, function(left, right)
+		return left.label < right.label
+	end)
+
+	CaseList = {}
+	for _, entry in ipairs(paid) do
+		table.insert(CaseList, entry)
+	end
+	for _, entry in ipairs(special) do
+		table.insert(CaseList, entry)
+	end
+
+	local labels = {}
+	for _, entry in ipairs(CaseList) do
+		table.insert(labels, entry.label)
+	end
+	return labels
+end
+
+local CaseLabels = buildCaseList()
+
+local function cheapestPaidLabels(amount)
+	local labels = {}
+	for _, entry in ipairs(CaseList) do
+		if not entry.case.free and not entry.case.vip and entry.price > 0 then
+			table.insert(labels, entry.label)
+			if #labels >= amount then
+				break
+			end
+		end
+	end
+	return labels
+end
+
+local function defaultLabel()
+	local labels = cheapestPaidLabels(1)
+	return labels[1] or CaseLabels[1]
+end
+
+----- Sell filters -----
+
+local function selectedRarities()
+	local set = {}
+	local picked = valueOf(ui.rarityDropdown, nil)
+	if type(picked) == "table" then
+		for _, label in ipairs(picked) do
+			local index = RARITY_INDEX[label]
+			if index then
+				set[index] = true
+			end
+		end
+	elseif type(picked) == "string" then
+		local index = RARITY_INDEX[picked]
+		if index then
+			set[index] = true
+		end
+	end
+	return set
+end
+
+local function selectedKinds()
+	local set = {}
+	local picked = valueOf(ui.kindDropdown, nil)
+	if type(picked) == "table" then
+		for _, label in ipairs(picked) do
+			local kind = KIND_INDEX[label]
+			if kind then
+				set[kind] = true
+			end
+		end
+	elseif type(picked) == "string" then
+		local kind = KIND_INDEX[picked]
+		if kind then
+			set[kind] = true
+		end
+	end
+	return set
+end
+
+local function keywordList()
+	local raw = valueOf(ui.keywordInput, "")
+	if type(raw) ~= "string" or raw == "" then
+		return {}
+	end
+	local list = {}
+	for piece in string.gmatch(raw, "[^,]+") do
+		local trimmed = string.lower(string.gsub(piece, "^%s*(.-)%s*$", "%1"))
+		if trimmed ~= "" then
+			table.insert(list, trimmed)
+		end
+	end
+	return list
+end
+
+local function matchesKeywords(info, keywords)
+	if #keywords == 0 then
+		return true
+	end
+	local haystack = string.lower(tostring(info.weapon or "") .. " " .. tostring(info.name or "") .. " " .. tostring(info.fullName or ""))
+	for _, word in ipairs(keywords) do
+		if string.find(haystack, word, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Decides whether one inventory entry may be sold. Locked entries never are.
+local function shouldSellEntry(entry, info, filters)
+	if not info then
+		return false
+	end
+	if filters.keepLocked and (entry.locked == true or entry.favorite == true) then
+		return false
+	end
+	local rarity = tonumber(info.rarity) or 1
+	if not filters.rarities[rarity] then
+		return false
+	end
+	local kind = tostring(info.kind or "")
+	if not filters.kinds[kind] then
+		return false
+	end
+	local worth = tonumber(info.value) or 0
+	if worth < filters.minValue or worth > filters.maxValue then
+		return false
+	end
+	if not matchesKeywords(info, filters.keywords) then
+		return false
+	end
+	return true
+end
+
+local function collectSellable(filters)
+	local ids = {}
+	local worth = 0
+	local kept = 0
+	for _, entry in ipairs(inventory()) do
+		local info = Catalog.ById[entry.id]
+		if info then
+			if shouldSellEntry(entry, info, filters) then
+				table.insert(ids, entry.uid)
+				worth = worth + (tonumber(info.value) or 0)
+			else
+				kept = kept + 1
+			end
+		end
+	end
+	return ids, worth, kept
+end
+
+local function currentFilters()
+	return {
+		rarities = selectedRarities(),
+		kinds = selectedKinds(),
+		keywords = keywordList(),
+		minValue = unitsToCredits(valueOf(ui.minValue, 0)),
+		maxValue = unitsToCredits(valueOf(ui.maxValue, 1e10)),
+		keepLocked = toggleOf(ui.keepLocked),
+	}
+end
+
+-- The server runs one action per profile at a time: opening and selling share the same
+-- ~1 s lock. Sleep out the known part of it, then retry while the answer says "busy".
+local function waitForAction(timeout)
+	local deadline = os.clock() + (timeout or 3)
+	while os.clock() < deadline do
+		local left = OPEN_LOCK - (os.clock() - State.lastActionAt)
+		if left <= 0 then
+			return
+		end
+		task.wait(math.min(left, 0.25))
+	end
+end
+
+-- One RemoteFunction call at a time. A server handler that errors leaves InvokeServer
+-- yielded forever, so the call runs in its own thread and the caller waits with a deadline
+-- instead of blocking the loop. A pending call is never duplicated: the next one waits.
+local Pending = { active = false, done = false, result = nil, failure = nil, startedAt = 0 }
+
+callRemote = function(kind, payload, timeout)
+	local deadline = os.clock() + (timeout or 4)
+
+	if Pending.active then
+		while Pending.active and os.clock() < deadline do
+			task.wait(0.05)
+		end
+		if Pending.active then
+			return nil, "timeout", true
+		end
+	end
+
+	Pending.active = true
+	Pending.done = false
+	Pending.result = nil
+	Pending.failure = nil
+	Pending.startedAt = os.clock()
+
+	task.spawn(function()
+		local ok, response = pcall(function()
+			return Request:InvokeServer(kind, payload)
+		end)
+		if ok then
+			Pending.result = response
+		else
+			Pending.failure = tostring(response)
+		end
+		Pending.done = true
+		Pending.active = false
+	end)
+
+	while not Pending.done and os.clock() < deadline do
+		task.wait(0.03)
+	end
+
+	if not Pending.done then
+		return nil, "timeout", true
+	end
+	if Pending.failure then
+		return nil, Pending.failure, false
+	end
+	return Pending.result, nil, false
+end
+
+local function isBusyText(text)
+	local lower = string.lower(tostring(text))
+	if string.find(lower, BUSY_TEXT, 1, true) then
+		return true
+	end
+	-- The free case has its own throttle: "Free cases: wait 1s".
+	if string.find(lower, "^wait", 1) or string.find(lower, "wait%d+s", 1) then
+		return true
+	end
+	return false
+end
+
+local function invokeAction(kind, payload, timeout)
+	local deadline = os.clock() + (timeout or 5)
+	local lastError = nil
+	repeat
+		waitForAction(timeout)
+		local response, failure, hung = callRemote(kind, payload, timeout)
+		if hung then
+			-- The previous call never came back: keep the loop honest instead of piling up.
+			State.lastActionAt = os.clock()
+			return nil, "timeout", true
+		end
+		if failure then
+			return nil, failure, false
+		end
+		if type(response) ~= "table" then
+			return nil, "empty response", false
+		end
+		if response.ok then
+			State.lastActionAt = os.clock()
+			return response, nil, false
+		end
+		local errorText = tostring(response.error or "")
+		lastError = errorText
+		if isBusyText(errorText) then
+			-- Still inside the server window: wait a little and retry. Do NOT re-arm the
+			-- lock timer here, or every retry would sleep a full extra second.
+			task.wait(0.3)
+		else
+			return response, nil, false
+		end
+	until os.clock() > deadline
+	return nil, lastError or "the server stayed busy", false
+end
+
+-- Returns how many entries were sold, or nil when the call could not run at all.
+local function sellNow(reason)
+	if State.selling then
+		return nil
+	end
+	local filters = currentFilters()
+	local ids, worth = collectSellable(filters)
+	if #ids == 0 then
+		return 0
+	end
+
+	State.selling = true
+	local soldCount = 0
+	local gained = 0
+	local failure = nil
+
+	for start = 1, #ids, SELL_CHUNK do
+		local chunk = {}
+		for index = start, math.min(start + SELL_CHUNK - 1, #ids) do
+			table.insert(chunk, ids[index])
+		end
+		local response, transportError, hung = invokeAction("sell", { ids = chunk }, 4)
+		if hung then
+			failure = "the server stopped answering"
+			break
+		end
+		if not response then
+			failure = tostring(transportError)
+			break
+		end
+		acceptState(response)
+		if response.ok then
+			soldCount = soldCount + #chunk
+			gained = gained + (tonumber(response.value) or 0)
+		else
+			failure = tostring(response.error)
+			break
+		end
+		task.wait(0.05)
+	end
+
+	State.selling = false
+
+	if soldCount > 0 then
+		State.stats.sold = State.stats.sold + soldCount
+		State.stats.earned = State.stats.earned + gained
+		pushLog(string.format("<Success>Sold %d items for %s</Success> (%s)", soldCount, money(gained), tostring(reason or "manual")))
+	end
+	if failure then
+		pushLog("<Warning>Sell stopped: " .. failure .. "</Warning>")
+	end
+	if failure and soldCount == 0 then
+		return nil
+	end
+	return soldCount, gained, worth
+end
+
+----- Rotation -----
+
+local function rotationRows()
+	if not ui.rotationTable then
+		return {}
+	end
+	local ok, rows = pcall(function()
+		return ui.rotationTable:Get()
+	end)
+	if not ok or type(rows) ~= "table" then
+		return {}
+	end
+	local list = {}
+	for _, row in ipairs(rows) do
+		if type(row) == "table" then
+			local entry = CaseByLabel[row.Case or row[1]]
+			local opens = tonumber(row.Opens or row[2]) or 0
+			if entry then
+				table.insert(list, { entry = entry, opens = math.max(1, math.floor(opens)) })
+			end
+		end
+	end
+	return list
+end
+
+local function rotationMode()
+	return toggleOf(ui.rotateCases)
+end
+
+local function currentAmount()
+	local limit = maxOpenPerCall()
+	local wanted = math.floor((tonumber(valueOf(ui.casesPerOpen, 6)) or 6) + 0.5)
+	return math.clamp(wanted, 1, limit)
+end
+
+local function affordable(entry, count)
+	if entry.price <= 0 then
+		return true
+	end
+	return credits() >= entry.price * count
+end
+
+local function singleCase()
+	local label = valueOf(ui.caseDropdown, nil)
+	if type(label) == "string" then
+		local entry = CaseByLabel[label]
+		if entry then
+			return entry
+		end
+	end
+	return CaseByLabel[defaultLabel()]
+end
+
+-- Walks the queue and returns the next entry that is not skipped, plus its row. Cases the
+-- server put on a cooldown ("Free cases: wait 2s", VIP cooldown) are walked past, and when
+-- every row is cooling down the shortest remaining wait is reported instead.
+local function pickRotationTarget()
+	local rows = rotationRows()
+	if #rows == 0 then
+		return nil, nil, "the rotation queue is empty"
+	end
+	local now = os.clock()
+	local bestCooldown = nil
+	for _ = 1, #rows do
+		if State.rotationIndex > #rows then
+			State.rotationIndex = 1
+			State.rotationOpened = 0
+		end
+		local index = math.clamp(State.rotationIndex, 1, #rows)
+		local row = rows[index]
+		local cooldownLeft = (State.caseCooldown[row.entry.id] or 0) - now
+		if cooldownLeft <= 0 and not State.skipped[row.entry.id] then
+			return row.entry, row, nil
+		end
+		if cooldownLeft > 0 and (bestCooldown == nil or cooldownLeft < bestCooldown) then
+			bestCooldown = cooldownLeft
+		end
+		State.rotationIndex = (index % #rows) + 1
+		State.rotationOpened = 0
+	end
+	if bestCooldown then
+		return nil, nil, "cooldown", bestCooldown
+	end
+	return nil, nil, "every case in the rotation is skipped"
+end
+
+local function advanceRotation(afterOpen)
+	local rows = rotationRows()
+	if #rows == 0 then
+		return
+	end
+	if afterOpen then
+		State.rotationOpened = State.rotationOpened + 1
+	end
+	local index = math.clamp(State.rotationIndex, 1, #rows)
+	local row = rows[index]
+	if not row or State.rotationOpened >= row.opens then
+		State.rotationIndex = (index % #rows) + 1
+		State.rotationOpened = 0
+	end
+end
+
+-- Moves to the next row no matter how many opens the current one still had left. Used when
+-- the row cannot be opened at all (no credits, cooldown, dead case) - otherwise the queue
+-- would sit on it until its "opens" counter ran out, which never happens.
+local function skipRotationRow()
+	local rows = rotationRows()
+	if #rows == 0 then
+		return
+	end
+	local index = math.clamp(State.rotationIndex, 1, #rows)
+	State.rotationIndex = (index % #rows) + 1
+	State.rotationOpened = 0
+end
+
+----- Dropped items -----
+
+local function noteDrops(items, caseEntry)
+	if type(items) ~= "table" then
+		return 0
+	end
+	local value = 0
+	for _, drop in ipairs(items) do
+		local info = Catalog.ById[drop.item]
+		if info then
+			local worth = tonumber(info.value) or 0
+			value = value + worth
+			State.stats.dropped = State.stats.dropped + 1
+			if worth > State.stats.best then
+				State.stats.best = worth
+				State.stats.bestName = tostring(info.fullName or info.name or "?")
+			end
+			if (tonumber(info.rarity) or 0) >= 4 then
+				pushLog(string.format(
+					"<Success>%s dropped from %s</Success> - %s",
+					tostring(info.fullName or info.name or "?"),
+					tostring(caseEntry and caseEntry.case.name or "case"),
+					money(worth)
+				))
+			end
+		end
+	end
+	return value
+end
+
+----- Opening -----
+
+local function requestOpen(entry, count)
+	local payload = {
+		case = entry.id,
+		count = count,
+		turbo = toggleOf(ui.fastMode),
+	}
+	if freeOpensFor(entry.id) > 0 and not State.noFree[entry.id] then
+		payload.free = true
+	end
+	return invokeAction("open", payload, 4)
+end
+
+-- One attempt. Returns "opened", "busy", "waiting", "skipped" or "error".
+local function openAttempt()
+	local entry, row
+	if rotationMode() then
+		local reason, cooldownLeft
+		entry, row, reason, cooldownLeft = pickRotationTarget()
+		if not entry then
+			if reason == "cooldown" then
+				return "cooling", string.format("every case is cooling down, next in %.1fs", cooldownLeft or 1)
+			end
+			return "empty", reason
+		end
+	else
+		entry = singleCase()
+		if not entry then
+			return "empty", "pick a case first"
+		end
+		local left = (State.caseCooldown[entry.id] or 0) - os.clock()
+		if left > 0 then
+			return "cooling", string.format("%s opens again in %.1fs", tostring(entry.case.name), left)
+		end
+	end
+
+	if State.skipped[entry.id] then
+		return "skipped", tostring(entry.case.name) .. " is skipped"
+	end
+
+	local count = currentAmount()
+	local cost = entry.price * count
+	local reserve = unitsToCredits(valueOf(ui.reserve, 0))
+
+	if cost > 0 and credits() - cost < reserve then
+		State.skipReason = "not enough credits for " .. tostring(entry.case.name)
+		State.notice = "credits"
+		if rotationMode() then
+			skipRotationRow()
+			return "rotate", State.skipReason
+		end
+		return "waiting", State.skipReason
+	end
+
+	if not affordable(entry, count) then
+		State.skipReason = "not enough credits for " .. tostring(entry.case.name)
+		State.notice = "credits"
+		if rotationMode() then
+			skipRotationRow()
+			return "rotate", State.skipReason
+		end
+		return "waiting", State.skipReason
+	end
+
+	State.opening = true
+	local response, transportError, hung = requestOpen(entry, count)
+	State.opening = false
+
+	if hung then
+		return "timeout", "the server is not answering yet"
+	end
+	if transportError then
+		if string.find(string.lower(tostring(transportError)), "busy", 1, true) then
+			return "busy", tostring(transportError)
+		end
+		return "error", "request failed: " .. tostring(transportError)
+	end
+	if type(response) ~= "table" then
+		return "error", "empty response from the server"
+	end
+
+	if response.ok then
+		State.lastOpenAt = os.clock()
+		State.notice = nil
+		State.skipReason = ""
+		acceptState(response)
+		State.stats.opens = State.stats.opens + 1
+		State.stats.cases = State.stats.cases + count
+		State.stats.invested = State.stats.invested + cost
+		local dropped = noteDrops(response.items, entry)
+		State.lastDrop = {
+			case = tostring(entry.case.name),
+			value = dropped,
+			count = #(response.items or {}),
+			at = os.clock(),
+		}
+		if rotationMode() then
+			advanceRotation(true)
+		end
+		return "opened", nil
+	end
+
+	local errorText = tostring(response.error or "")
+	local lower = string.lower(errorText)
+
+	local waitSeconds = string.match(lower, "wait%s*(%d+)%s*s")
+	if waitSeconds and not string.find(lower, "current action", 1, true) then
+		-- Per-case throttle ("Free cases: wait 2s"): park that case, keep the queue moving.
+		State.caseCooldown[entry.id] = os.clock() + tonumber(waitSeconds)
+		State.lastCooldown = { id = entry.id, seconds = tonumber(waitSeconds) }
+		if rotationMode() then
+			skipRotationRow()
+			return "rotate", errorText
+		end
+		return "cooling", errorText
+	elseif string.find(lower, "wait for the current action", 1, true) or string.find(lower, "^wait", 1) then
+		return "busy", errorText
+	elseif string.find(lower, "choose 1 to 6", 1, true) or string.find(lower, "opens up to 10", 1, true) then
+		return "clamp", errorText
+	elseif string.find(lower, "no free opens", 1, true) then
+		-- The free case answered that this profile has no free opens. Try a plain (price 0)
+		-- open next time, and give up on the row after a few answers like this.
+		State.noFree[entry.id] = true
+		State.noFreeHits[entry.id] = (State.noFreeHits[entry.id] or 0) + 1
+		if State.noFreeHits[entry.id] >= 3 then
+			State.noFreeHits[entry.id] = 0
+			if rotationMode() then
+				skipRotationRow()
+				return "rotate", errorText
+			end
+			return "waiting", errorText
+		end
+		return "busy", errorText
+	elseif string.find(lower, "inventory full", 1, true) then
+		return "full", errorText
+	elseif string.find(lower, "not enough", 1, true) or string.find(lower, "credits", 1, true) then
+		State.skipReason = "not enough credits"
+		State.notice = "credits"
+		if rotationMode() then
+			skipRotationRow()
+			return "rotate", errorText
+		end
+		return "waiting", errorText
+	elseif string.find(lower, "opens again in", 1, true) then
+		-- VIP case cooldown: temporary, so the queue simply moves on.
+		if rotationMode() then
+			skipRotationRow()
+			return "rotate", errorText
+		end
+		return "waiting", errorText
+	elseif string.find(lower, "free-case slot", 1, true) then
+		State.skipped[entry.id] = true
+		return "skipped", errorText
+	elseif string.find(lower, "vip", 1, true) then
+		State.skipped[entry.id] = true
+		return "skipped", errorText
+	elseif string.find(lower, "ended", 1, true) or string.find(lower, "verified item prices", 1, true) then
+		State.skipped[entry.id] = true
+		return "skipped", errorText
+	end
+
+	return "error", errorText
+end
+
+local function stopLoop(reason)
+	if not State.running then
+		return
+	end
+	State.running = false
+	State.token = State.token + 1
+	if ui.autoOpen then
+		pcall(function()
+			ui.autoOpen:Set(false, true)
+		end)
+	end
+	pushLog("<Warning>Auto open stopped: " .. tostring(reason or "manual") .. "</Warning>")
+end
+
+local function loopStep()
+	State.lastLoopAt = os.clock()
+
+	-- Inventory guard runs first: a full bag makes every open fail.
+	local guard = tonumber(valueOf(ui.forceSellAt, INVENTORY_MAX)) or INVENTORY_MAX
+	if #inventory() >= guard then
+		local sold = sellNow("inventory guard")
+		if not sold or sold == 0 then
+			stopLoop("inventory is full and no item matches the sell filters")
+			return 0.5
+		end
+		State.opensSinceSell = 0
+		return 0.05
+	end
+
+	-- Selling costs the same ~1 s lock as opening, so it runs in one batch every N opens
+	-- instead of after each one (that would halve the opening speed).
+	local every = math.floor(tonumber(valueOf(ui.sellEvery, 8)) or 8)
+	if toggleOf(ui.autoSell) and every > 0 and State.opensSinceSell >= every then
+		local sold = sellNow("every " .. tostring(every) .. " opens")
+		if sold and sold > 0 then
+			State.opensSinceSell = 0
+		elseif sold == 0 then
+			-- Nothing matches the filters: do not burn a server pause on every step.
+			State.opensSinceSell = 0
+			pushLog("<Muted>Nothing matched the sell filters, waiting " .. tostring(every) .. " more opens</Muted>")
+		end
+		return 0.05
+	end
+
+	local status, message = openAttempt()
+	State.lastOpenStatus = status
+
+	if status == "opened" then
+		State.opensSinceSell = State.opensSinceSell + 1
+		local pause = math.max(OPEN_LOCK - (os.clock() - State.lastActionAt), 0)
+		return math.max(pause, 0.05)
+	elseif status == "busy" then
+		return 0.25
+	elseif status == "cooling" then
+		State.skipReason = message or "cooling down"
+		return 0.5
+	elseif status == "timeout" then
+		pushLog("<Warning>The server is slow to answer, waiting</Warning>")
+		return 2.0
+	elseif status == "clamp" then
+		pcall(function()
+			ui.casesPerOpen:Set(maxOpenPerCall())
+		end)
+		return 0.1
+	elseif status == "full" then
+		local sold = sellNow("inventory full")
+		if not sold or sold == 0 then
+			stopLoop("inventory is full and nothing can be sold")
+			return 0.5
+		end
+		return 0.05
+	elseif status == "rotate" or status == "skipped" then
+		-- Every row is too expensive for the balance: sell what the filters allow so the
+		-- queue can recover, but only every few seconds instead of on every step.
+		if State.notice == "credits" and toggleOf(ui.autoSell) then
+			if os.clock() - State.lastSellAttempt > 6 then
+				State.lastSellAttempt = os.clock()
+				sellNow("refill for credits")
+				State.opensSinceSell = 0
+			end
+		end
+		return 0.15
+	elseif status == "waiting" then
+		-- No money right now: sell what the filters allow, then wait for the balance.
+		local sold = sellNow("waiting for credits")
+		State.lastSellAttempt = os.clock()
+		if not sold or sold == 0 then
+			State.skipReason = message or "not enough credits"
+			return 1.0
+		end
+		State.opensSinceSell = 0
+		return 0.05
+	elseif status == "empty" then
+		stopLoop(message or "nothing to open")
+		return 0.5
+	elseif status == "error" then
+		State.lastErrorMessage = tostring(message)
+		pushLog("<Error>" .. tostring(message) .. "</Error>")
+		return 0.75
+	end
+	return 0.2
+end
+
+local function startLoop()
+	if State.running then
+		return
+	end
+	refreshState()
+	State.running = true
+	State.token = State.token + 1
+	local token = State.token
+	pushLog("<Success>Auto open started</Success> - up to " .. tostring(maxOpenPerCall()) .. " cases per call")
+
+	task.spawn(function()
+		while State.running and State.token == token do
+			local started = os.clock()
+			local ok, result = pcall(loopStep)
+			State.lastIterationMs = (os.clock() - started) * 1000
+			if not ok then
+				pushLog("<Error>Loop error: " .. tostring(result) .. "</Error>")
+				task.wait(1)
+			else
+				task.wait(math.max(tonumber(result) or 0.1, 0.02))
+			end
+		end
+	end)
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+----- Window -----
+
+Window = Airflow:CreateWindow({
+	Name = "Robscript Team - Caser",
+	LoadingSubtitle = "auto cases, rotation, selling",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(820, 580),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "CaserHub" },
+	Home = {
+		Title = "Robscript Team - Caser",
+		Welcome = "Welcome back,",
+		Tier = "v1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+----- Tab: Cases -----
+
+local CasesTab = Window:CreateTab({ Name = "Cases", Icon = "package" })
+local OpenBox = CasesTab:CreateGroupbox({ Name = "Auto open", Icon = "zap", Side = "Left" })
+local QueueBox = CasesTab:CreateGroupbox({ Name = "Rotation", Icon = "repeat", Side = "Right" })
+
+OpenBox:CreateParagraph({
+	Title = "How it works",
+	Content = "The script calls the same Request(\"open\") the case page uses. Without VIP the server takes up to 6 cases per call and needs about a second between calls. Turn AUTO OPEN on and leave it.",
+})
+
+ui.autoOpen = OpenBox:CreateToggle({
+	Name = "Auto open",
+	Desc = "Opens cases in a loop until you stop it",
+	Flag = "AutoOpen",
+	CurrentValue = false,
+	Callback = function(enabled)
+		if enabled then
+			startLoop()
+		else
+			stopLoop("manual")
+		end
+	end,
+})
+
+ui.casesPerOpen = OpenBox:CreateStepper({
+	Name = "Cases per call",
+	Desc = "6 without VIP, 10 with VIP or the preset pass",
+	Range = { 1, 10 },
+	Increment = 1,
+	CurrentValue = tonumber(Saved.perOpen) or 6,
+	Flag = "CasesPerOpen",
+})
+
+ui.fastMode = OpenBox:CreateToggle({
+	Name = "Fast mode",
+	Desc = "Send turbo = true, the same flag the free fast mode uses",
+	Flag = "FastMode",
+	CurrentValue = true,
+})
+
+ui.reserve = OpenBox:CreateSlider({
+	Name = "Keep credits",
+	Desc = "Never spend below this balance (same units as the game)",
+	Range = { 0, 200000 },
+	Increment = 100,
+	CurrentValue = tonumber(Saved.reserveU) or 0,
+	Suffix = " ◈",
+	Flag = "Reserve",
+})
+
+ui.autoSell = OpenBox:CreateToggle({
+	Name = "Auto sell",
+	Desc = "Batch sells with the Selling tab filters (see \"Sell every N opens\" there)",
+	Flag = "AutoSell",
+	CurrentValue = Saved.autoSell ~= false,
+})
+
+OpenBox:CreateStatus({
+	Name = "Balance",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		return "<Success>" .. money(credits()) .. "</Success>"
+	end,
+})
+
+OpenBox:CreateStatus({
+	Name = "Opened",
+	Style = "Stat",
+	Update = function()
+		return tostring(State.stats.cases)
+	end,
+})
+
+OpenBox:CreateStatus({
+	Name = "Spent",
+	Style = "Stat",
+	Update = function()
+		return money(State.stats.invested)
+	end,
+})
+
+OpenBox:CreateStatus({
+	Name = "Earned",
+	Style = "Stat",
+	Update = function()
+		return money(State.stats.earned)
+	end,
+})
+
+OpenBox:CreateStatus({
+	Name = "Profit",
+	Style = "Stat",
+	Update = function()
+		local profit = State.stats.earned - State.stats.invested
+		if profit >= 0 then
+			return "<Success>" .. money(profit) .. "</Success>"
+		end
+		return "<Error>" .. money(profit) .. "</Error>"
+	end,
+})
+
+QueueBox:CreateParagraph({
+	Title = "Rotation",
+	Content = "Each row opens its case N times, then the script moves to the next row and loops. With rotation off the single case below is used.",
+})
+
+ui.rotateCases = QueueBox:CreateToggle({
+	Name = "Rotate cases",
+	Desc = "Walk the queue instead of one case",
+	Flag = "RotateCases",
+	CurrentValue = Saved.rotate ~= false,
+	Callback = function()
+		State.rotationIndex = 1
+		State.rotationOpened = 0
+	end,
+})
+
+local queueDefaults = {}
+do
+	if type(Saved.rows) == "table" and #Saved.rows > 0 then
+		for _, row in ipairs(Saved.rows) do
+			if type(row) == "table" then
+				local label = row.Case or row[1]
+				-- Labels carry the price, so they change when the formatting changes. Prefer
+				-- the stable case id and only then the old label.
+				if not CaseByLabel[label] and row.Id and LabelById[row.Id] then
+					label = LabelById[row.Id]
+				end
+				local opens = tonumber(row.Opens or row[2]) or 5
+				if CaseByLabel[label] then
+					table.insert(queueDefaults, { Case = label, Opens = math.max(1, math.floor(opens)) })
+				end
+			end
+		end
+	end
+	if #queueDefaults == 0 then
+		local labels = cheapestPaidLabels(3)
+		if #labels == 0 then
+			labels = { defaultLabel() }
+		end
+		for _, label in ipairs(labels) do
+			table.insert(queueDefaults, { Case = label, Opens = 5 })
+		end
+	end
+end
+
+ui.rotationTable = QueueBox:CreateTable({
+	Name = "Queue",
+	Desc = "Case and how many opens before switching",
+	Columns = {
+		{ Name = "Case", Type = "Dropdown", Options = CaseLabels, Width = 0.66, Searchable = true },
+		{ Name = "Opens", Type = "Number", Min = 1, Max = 9999, Integer = true, Align = "Right", Width = 0.24 },
+	},
+	Rows = queueDefaults,
+	NewRow = function()
+		return { Case = defaultLabel(), Opens = 5 }
+	end,
+	MaxRows = 12,
+	Flag = "RotationQueue",
+	OnChanged = function()
+		State.rotationIndex = 1
+		State.rotationOpened = 0
+	end,
+})
+
+ui.caseDropdown = QueueBox:CreateDropdown({
+	Name = "Single case",
+	Desc = "Used when rotation is off",
+	Options = CaseLabels,
+	CurrentOption = CaseByLabel[Saved.single] and Saved.single or defaultLabel(),
+	Searchable = true,
+	MaxRows = 8,
+	Flag = "SingleCase",
+})
+
+QueueBox:CreateStatus({
+	Name = "Now",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.4,
+	Update = function()
+		if not State.running then
+			return "<Muted>idle</Muted>"
+		end
+		if not rotationMode() then
+			local entry = singleCase()
+			return entry and tostring(entry.case.name) or "<Muted>none</Muted>"
+		end
+		local rows = rotationRows()
+		if #rows == 0 then
+			return "<Warning>empty queue</Warning>"
+		end
+		local index = math.clamp(State.rotationIndex, 1, #rows)
+		local row = rows[index]
+		return string.format("%s  %d/%d", tostring(row.entry.case.name), State.rotationOpened, row.opens)
+	end,
+})
+
+QueueBox:CreateStatus({
+	Name = "Next open",
+	Style = "Row",
+	UpdateRate = 0.3,
+	Update = function()
+		if not State.running then
+			return "<Muted>off</Muted>"
+		end
+		if State.notice == "credits" then
+			return "<Warning>no credits</Warning>"
+		end
+		if os.clock() - State.lastLoopAt > 6 then
+			return "<Warning>stalled</Warning>"
+		end
+		local wait = math.max(OPEN_LOCK - (os.clock() - State.lastActionAt), 0)
+		if wait > 0.1 then
+			return string.format("<Warning>%.1f s</Warning>", wait)
+		end
+		return "<Success>now</Success>"
+	end,
+})
+
+QueueBox:CreateStatus({
+	Name = "Reason",
+	Style = "Row",
+	UpdateRate = 0.6,
+	Update = function()
+		if State.skipReason and State.skipReason ~= "" then
+			return "<Muted>" .. State.skipReason .. "</Muted>"
+		end
+		return "<Muted>-</Muted>"
+	end,
+})
+
+QueueBox:CreateStatus({
+	Name = "Last drop",
+	Style = "Row",
+	UpdateRate = 0.6,
+	Update = function()
+		local drop = State.lastDrop
+		if not drop then
+			return "<Muted>nothing yet</Muted>"
+		end
+		return string.format("%d items, %s", drop.count, money(drop.value))
+	end,
+})
+
+QueueBox:CreateButtonRow({
+	Buttons = {
+		{
+			Name = "Open once",
+			Callback = function()
+				local ok, result = pcall(loopStep)
+				if not ok then
+					notify("Robscript Team - Caser", tostring(result), "Error")
+				end
+			end,
+		},
+		{
+			Name = "Stop",
+			Style = "Danger",
+			Callback = function()
+				stopLoop("manual")
+			end,
+		},
+		{
+			Name = "Reset skips",
+			Callback = function()
+				State.skipped = {}
+				State.noFree = {}
+				State.rotationIndex = 1
+				State.rotationOpened = 0
+				pushLog("<Muted>skip list cleared</Muted>")
+			end,
+		},
+	},
+})
+
+----- Tab: Selling -----
+
+local SellTab = Window:CreateTab({ Name = "Selling", Icon = "coins" })
+local FilterBox = SellTab:CreateGroupbox({ Name = "Filters", Icon = "sliders-horizontal", Side = "Left" })
+local ActionBox = SellTab:CreateGroupbox({ Name = "Inventory", Icon = "shopping-cart", Side = "Right" })
+
+FilterBox:CreateParagraph({
+	Title = "What gets sold",
+	Content = "An item is sold only when it passes every filter: rarity, kind, weapon keyword and the price range. Locked items are never sold.",
+})
+
+ui.rarityDropdown = FilterBox:CreateDropdown({
+	Name = "Rarities",
+	Desc = "Which rarity tiers may be sold",
+	Options = RARITY_OPTIONS,
+	MultipleOptions = true,
+	CurrentOption = (type(Saved.rarities) == "table" and #Saved.rarities > 0) and Saved.rarities or RARITY_OPTIONS,
+	Flag = "SellRarities",
+	MaxRows = 6,
+})
+
+ui.kindDropdown = FilterBox:CreateDropdown({
+	Name = "Item kinds",
+	Desc = "Guns, knives, gloves, agents, stickers, patches, charms, music",
+	Options = KIND_OPTIONS,
+	MultipleOptions = true,
+	CurrentOption = (type(Saved.kinds) == "table" and #Saved.kinds > 0) and Saved.kinds or KIND_OPTIONS,
+	Flag = "SellKinds",
+	MaxRows = 8,
+})
+
+ui.keywordInput = FilterBox:CreateInput({
+	Name = "Weapon contains",
+	Desc = "Optional, comma separated, matches part of the weapon or item name",
+	PlaceholderText = "ak-47, karambit",
+	CurrentValue = type(Saved.keywords) == "string" and Saved.keywords or "",
+	Flag = "SellKeywords",
+})
+
+ui.minValue = FilterBox:CreateSlider({
+	Name = "Sell items worth at least",
+	Desc = "0 = no lower limit",
+	Range = { 0, 50000 },
+	Increment = 5,
+	CurrentValue = tonumber(Saved.minValueU) or 0,
+	Suffix = " ◈",
+	Flag = "SellMinValue",
+})
+
+ui.maxValue = FilterBox:CreateSlider({
+	Name = "Keep items worth at least",
+	Desc = "Anything above this price is never sold",
+	Range = { 0, 300000 },
+	Increment = 50,
+	CurrentValue = tonumber(Saved.maxValueU) or 2500,
+	Suffix = " ◈",
+	Flag = "SellMaxValue",
+})
+
+ui.keepLocked = FilterBox:CreateToggle({
+	Name = "Protect locked items",
+	Desc = "Items you locked in the game stay in the inventory",
+	Flag = "KeepLocked",
+	CurrentValue = true,
+})
+
+ui.sellEvery = ActionBox:CreateStepper({
+	Name = "Sell every N opens",
+	Desc = "Selling costs the same server pause as opening, so it runs in batches",
+	Range = { 1, 50 },
+	Increment = 1,
+	CurrentValue = tonumber(Saved.sellEvery) or 8,
+	Flag = "SellEvery",
+})
+
+ui.forceSellAt = ActionBox:CreateStepper({
+	Name = "Force sell at inventory",
+	Desc = "The bag holds " .. tostring(INVENTORY_MAX) .. " items; sell at this fill level",
+	Range = { 100, INVENTORY_MAX },
+	Increment = 10,
+	CurrentValue = tonumber(Saved.forceSellAt) or 450,
+	Flag = "ForceSellAt",
+})
+
+ActionBox:CreateButtonRow({
+	Buttons = {
+		{
+			Name = "Sell now",
+			Style = "Primary",
+			Callback = function()
+				State.selling = false
+				local sold, gained = sellNow("manual")
+				if sold == 0 then
+					notify("Robscript Team - Caser", "Nothing matches the filters", "Warning")
+				elseif sold then
+					notify("Robscript Team - Caser", string.format("Sold %d items for %s", sold, money(gained)), "Success")
+				end
+			end,
+		},
+		{
+			Name = "Refresh",
+			Callback = function()
+				if refreshState() then
+					pushLog("<Muted>profile refreshed</Muted>")
+				else
+					notify("Robscript Team - Caser", "State request failed", "Error")
+				end
+			end,
+		},
+	},
+})
+
+ActionBox:CreateStatus({
+	Name = "Inventory",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		local count = #inventory()
+		local text = string.format("%d / %d", count, INVENTORY_MAX)
+		if count >= (tonumber(valueOf(ui.forceSellAt, INVENTORY_MAX)) or INVENTORY_MAX) then
+			return "<Error>" .. text .. "</Error>"
+		end
+		return text
+	end,
+})
+
+ActionBox:CreateStatus({
+	Name = "Matches",
+	Style = "Row",
+	UpdateRate = 0.6,
+	Update = function()
+		local ids, worth = collectSellable(currentFilters())
+		return string.format("%d items, %s", #ids, money(worth))
+	end,
+})
+
+ActionBox:CreateStatus({
+	Name = "Sold",
+	Style = "Stat",
+	Update = function()
+		return tostring(State.stats.sold)
+	end,
+})
+
+ActionBox:CreateStatus({
+	Name = "Earned",
+	Style = "Stat",
+	Update = function()
+		return money(State.stats.earned)
+	end,
+})
+
+ActionBox:CreateStatus({
+	Name = "Best drop",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		if State.stats.best <= 0 then
+			return "<Muted>nothing yet</Muted>"
+		end
+		return string.format("%s (%s)", State.stats.bestName, money(State.stats.best))
+	end,
+})
+
+----- Tab: Logs -----
+
+local LogTab = Window:CreateTab({ Name = "Logs", Icon = "scroll-text" })
+local LogBox = LogTab:CreateGroupbox({ Name = "What the script is doing", Side = "Left" })
+
+LogElement = LogBox:CreateLog({
+	Name = "Activity",
+	MaxEntries = 300,
+	MaxRows = 16,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+----- Tab: Info -----
+
+local InfoTab = Window:CreateTab({ Name = "Info", Icon = "info" })
+local InfoBox = InfoTab:CreateGroupbox({ Name = "Protocol", Side = "Left" })
+local NumbersBox = InfoTab:CreateGroupbox({ Name = "Session", Side = "Right" })
+
+InfoBox:CreateParagraph({
+	Title = "Open",
+	Content = "Request:InvokeServer(\"open\", { case = id, count = 1..6, turbo = true, free = true }) - the server answers with the dropped items and the fresh profile.",
+})
+
+InfoBox:CreateParagraph({
+	Title = "Sell",
+	Content = "Request:InvokeServer(\"sell\", { ids = { uid, ... } }) - chunked by " .. tostring(SELL_CHUNK) .. " ids per call.",
+})
+
+InfoBox:CreateParagraph({
+	Title = "Limits",
+	Content = "1..6 cases per call (10 with VIP or the preset pass), about one call per second, " .. tostring(INVENTORY_MAX) .. " inventory slots, the free case needs free opens from rank rewards.",
+})
+
+InfoBox:CreateStatus({
+	Name = "Max per call",
+	Style = "Row",
+	UpdateRate = 2,
+	Update = function()
+		return tostring(maxOpenPerCall())
+	end,
+})
+
+NumbersBox:CreateStatus({
+	Name = "Calls",
+	Style = "Row",
+	Update = function()
+		return tostring(State.stats.opens)
+	end,
+})
+
+NumbersBox:CreateStatus({
+	Name = "Cases",
+	Style = "Row",
+	Update = function()
+		return tostring(State.stats.cases)
+	end,
+})
+
+NumbersBox:CreateStatus({
+	Name = "Dropped",
+	Style = "Row",
+	Update = function()
+		return tostring(State.stats.dropped)
+	end,
+})
+
+NumbersBox:CreateStatus({
+	Name = "Balance",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		return money(credits())
+	end,
+})
+
+NumbersBox:CreateStatus({
+	Name = "Free case opens",
+	Style = "Row",
+	Update = function()
+		local map = State.profile and State.profile.freeOpens
+		if type(map) ~= "table" then
+			return "<Muted>none</Muted>"
+		end
+		local parts = {}
+		for caseId, count in pairs(map) do
+			table.insert(parts, tostring(caseId) .. ": " .. tostring(count))
+		end
+		table.sort(parts)
+		if #parts == 0 then
+			return "<Muted>none</Muted>"
+		end
+		return table.concat(parts, ", ")
+	end,
+})
+
+NumbersBox:CreateButton({
+	Name = "Destroy hub",
+	Style = "Danger",
+	Callback = function()
+		local api = getgenv().CaserHub
+		if api and type(api.destroy) == "function" then
+			api.destroy()
+		end
+	end,
+})
+
+----- Boot -----
+
+task.spawn(function()
+	refreshState()
+	if State.vip or presetUnlocked() then
+		pushLog("<Success>VIP/preset detected</Success> - up to 10 cases per call")
+	end
+	pushLog("<Muted>Robscript Team - Caser ready</Muted> - " .. tostring(#CaseList) .. " cases in the list")
+end)
+
+----- Public API -----
+
+local api = {}
+
+local function destroy()
+	State.running = false
+	State.destroyed = true
+	State.token = State.token + 1
+	pcall(saveSaved)
+	pcall(function()
+		Window:Destroy()
+	end)
+	if getgenv().CaserHub == api then
+		getgenv().CaserHub = nil
+	end
+end
+
+api = {
+	state = State,
+	stats = State.stats,
+	open = function(count)
+		if count then
+			pcall(function()
+				ui.casesPerOpen:Set(tonumber(count) or 6)
+			end)
+		end
+		return openAttempt()
+	end,
+	start = function()
+		pcall(function()
+			ui.autoOpen:Set(true, true)
+		end)
+		startLoop()
+	end,
+	stop = function()
+		stopLoop("api")
+	end,
+	sell = function()
+		return sellNow("api")
+	end,
+	refresh = refreshState,
+	credits = credits,
+	inventory = inventory,
+	money = money,
+	gameMoney = gameMoney,
+	unitsToCredits = unitsToCredits,
+	filterPreview = function()
+		local ids, worth = collectSellable(currentFilters())
+		return { count = #ids, value = worth }
+	end,
+	skip = State.skipped,
+	destroy = destroy,
+	saveConfig = saveSaved,
+	configFile = CONFIG_FILE,
+	window = Window,
+	ui = ui,
+}
+
+getgenv().CaserHub = api
+
+pushLog("<Success>Robscript Team - Caser loaded</Success> - RightControl toggles the window")
+
+-- Registered last on purpose: the loop compares itself with getgenv().CaserHub, so it has to
+-- run after the hub published itself there.
+task.spawn(function()
+	local owner = api
+	while owner ~= nil and getgenv().CaserHub == owner and not State.destroyed do
+		task.wait(10)
+		if getgenv().CaserHub == owner and not State.destroyed then
+			pcall(saveSaved)
+		end
+	end
+end)
