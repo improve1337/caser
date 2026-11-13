@@ -1,5 +1,5 @@
 --[[
-pushLog("<Success>Robscript Team - Caser loaded</Success> - RightControl toggles the window")
+pushLog("<Success>Vanta loaded</Success> - RightControl toggles the window")
 =====================================================================
   CASER - Case Farm Hub (Potassium / Robly Airflow UI)
   v1.0 - auto case opening with rotation, inventory selling by filters
@@ -31,6 +31,7 @@ pushLog("<Success>Robscript Team - Caser loaded</Success> - RightControl toggles
 =====================================================================
 --]]
 
+-- Vanta / iOS 18 - Case Farm Hub
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer
@@ -285,7 +286,7 @@ local LabelById = {}
 
 -- The Airflow window flags survive only while the script runs, and the rotation queue is not
 -- a flag at all, so the queue and the filters are kept in a small JSON file next to the script.
-local CONFIG_FILE = "RobscriptTeamCaser.json"
+local CONFIG_FILE = "Vanta.json"
 local HttpService = game:GetService("HttpService")
 local Saved = {}
 
@@ -1253,17 +1254,18 @@ end
 
 ----- Theme -----
 
+-- Vanta / iOS 18 visual system: restrained accent, stepped surfaces, no neon.
 local THEME = {
-	Background = Color3.fromHex("#0A0A0C"),
-	Surface = Color3.fromHex("#141418"),
-	Surface2 = Color3.fromHex("#1A1A20"),
-	Surface3 = Color3.fromHex("#2A2A33"),
-	Stroke = Color3.fromHex("#26262E"),
-	StrokeHover = Color3.fromHex("#3C3C49"),
-	Accent = Color3.fromHex("#FF3B7F"),
-	AccentDark = Color3.fromHex("#1A0710"),
-	Text = Color3.fromHex("#F5F5F7"),
-	Muted = Color3.fromHex("#8D8D99"),
+	Background = Color3.fromHex("#F2F2F7"),
+	Surface = Color3.fromHex("#FFFFFF"),
+	Surface2 = Color3.fromHex("#F8F8FA"),
+	Surface3 = Color3.fromHex("#E5E5EA"),
+	Stroke = Color3.fromHex("#D1D1D6"),
+	StrokeHover = Color3.fromHex("#AEAEB2"),
+	Accent = Color3.fromHex("#007AFF"),
+	AccentDark = Color3.fromHex("#D6E9FF"),
+	Text = Color3.fromHex("#1C1C1E"),
+	Muted = Color3.fromHex("#6C6C70"),
 }
 
 Airflow.ThemePresets.Robscript = THEME
@@ -1272,18 +1274,18 @@ Airflow:SetDefaultTheme(THEME)
 ----- Window -----
 
 Window = Airflow:CreateWindow({
-	Name = "Robscript Team - Caser",
-	LoadingSubtitle = "автооткрытие кейсов, ротация, продажа",
+	Name = "Vanta / iOS 18",
+	LoadingSubtitle = "Caser farm hub — Caser opened from shelf",
 	ToggleUIKeybind = "RightControl",
 	Size = UDim2.fromOffset(820, 580),
-	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Backdrop = { Weather = "Rain", Tint = 0.25 },
 	Theme = THEME,
-	ConfigurationSaving = { Enabled = true, FolderName = "CaserHub" },
+	ConfigurationSaving = { Enabled = true, FolderName = "Vanta" },
 	Home = {
-		Title = "Robscript Team - Caser",
-		Welcome = "С возвращением,",
+		Title = "Vanta / iOS 18",
+		Welcome = "Good day, Caser",
 		Tier = "v1.0",
-		Stats = { "Players", "Сессия", "FPS", "Ping", "Game", "Executor" },
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
 	},
 })
 
@@ -1542,7 +1544,7 @@ QueueBox:CreateButtonRow({
 			Callback = function()
 				local ok, result = pcall(loopStep)
 				if not ok then
-					notify("Robscript Team - Caser", tostring(result), "Error")
+					notify("Vanta", tostring(result), "Error")
 				end
 			end,
 		},
@@ -1659,9 +1661,9 @@ ActionBox:CreateButtonRow({
 				State.selling = false
 				local sold, gained = sellNow("manual")
 				if sold == 0 then
-					notify("Robscript Team - Caser", "Нет предметов по фильтрам", "Warning")
+					notify("Vanta", "Нет предметов по фильтрам", "Warning")
 				elseif sold then
-					notify("Robscript Team - Caser", string.format("Sold %d items for %s", sold, money(gained)), "Success")
+					notify("Vanta", string.format("Sold %d items for %s", sold, money(gained)), "Success")
 				end
 			end,
 		},
@@ -1671,7 +1673,7 @@ ActionBox:CreateButtonRow({
 				if refreshState() then
 					pushLog("<Muted>profile refreshed</Muted>")
 				else
-					notify("Robscript Team - Caser", "Не удалось получить состояние", "Error")
+					notify("Vanta", "Не удалось получить состояние", "Error")
 				end
 			end,
 		},
@@ -1846,7 +1848,7 @@ task.spawn(function()
 	if State.vip or presetUnlocked() then
 		pushLog("<Success>VIP/preset detected</Success> - up to 10 cases per call")
 	end
-	pushLog("<Muted>Robscript Team - Caser ready</Muted> - " .. tostring(#CaseList) .. " cases in the list")
+	pushLog("<Muted>Vanta ready</Muted> - " .. tostring(#CaseList) .. " cases in the list")
 end)
 
 ----- Public API -----
@@ -1909,7 +1911,7 @@ api = {
 
 getgenv().CaserHub = api
 
-pushLog("<Success>Robscript Team - Caser loaded</Success> - RightControl toggles the window")
+pushLog("<Success>Vanta loaded</Success> - RightControl toggles the window")
 
 -- Registered last on purpose: the loop compares itself with getgenv().CaserHub, so it has to
 -- run after the hub published itself there.
