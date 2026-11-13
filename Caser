@@ -108,31 +108,31 @@ local BUSY_TEXT = "wait for the current action"
 local INVENTORY_MAX = tonumber(Catalog.MaxInventory) or 500
 
 local RARITY_LABELS = {
-	[1] = "1 - Mil-Spec",
-	[2] = "2 - Restricted",
-	[3] = "3 - Classified",
-	[4] = "4 - Covert",
-	[5] = "5 - Exceedingly rare",
+	[1] = "1 - Армейское качество",
+	[2] = "2 - Запрещённое",
+	[3] = "3 - Засекреченное",
+	[4] = "4 - Тайное",
+	[5] = "5 - Чрезвычайно редкое",
 }
 
 local RARITY_INDEX = {
-	["1 - Mil-Spec"] = 1,
-	["2 - Restricted"] = 2,
-	["3 - Classified"] = 3,
-	["4 - Covert"] = 4,
-	["5 - Exceedingly rare"] = 5,
+	["1 - Армейское качество"] = 1,
+	["2 - Запрещённое"] = 2,
+	["3 - Засекреченное"] = 3,
+	["4 - Тайное"] = 4,
+	["5 - Чрезвычайно редкое"] = 5,
 }
 
 local KIND_ORDER = { "gun", "knife", "gloves", "agent", "sticker", "patch", "charm", "music" }
 local KIND_LABELS = {
-	gun = "Guns",
-	knife = "Knives",
-	gloves = "Gloves",
-	agent = "Agents",
-	sticker = "Stickers",
-	patch = "Patches",
-	charm = "Charms",
-	music = "Music kits",
+	gun = "Оружие",
+	knife = "Ножи",
+	gloves = "Перчатки",
+	agent = "Агенты",
+	sticker = "Наклейки",
+	patch = "Нашивки",
+	charm = "Брелоки",
+	music = "Музыкальные наборы",
 }
 local KIND_INDEX = {}
 for kind, label in pairs(KIND_LABELS) do
@@ -250,7 +250,7 @@ end
 
 local function notify(title, content, kind)
 	pcall(function()
-		Window:Notify({ Title = title, Content = content, Duration = 4, Type = kind or "Info" })
+		Window:Notify({ Title = title, Content = content, Duration = 4, Type = kind or "Информация" })
 	end)
 end
 
@@ -1273,7 +1273,7 @@ Airflow:SetDefaultTheme(THEME)
 
 Window = Airflow:CreateWindow({
 	Name = "Robscript Team - Caser",
-	LoadingSubtitle = "auto cases, rotation, selling",
+	LoadingSubtitle = "автооткрытие кейсов, ротация, продажа",
 	ToggleUIKeybind = "RightControl",
 	Size = UDim2.fromOffset(820, 580),
 	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
@@ -1281,26 +1281,26 @@ Window = Airflow:CreateWindow({
 	ConfigurationSaving = { Enabled = true, FolderName = "CaserHub" },
 	Home = {
 		Title = "Robscript Team - Caser",
-		Welcome = "Welcome back,",
+		Welcome = "С возвращением,",
 		Tier = "v1.0",
-		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+		Stats = { "Players", "Сессия", "FPS", "Ping", "Game", "Executor" },
 	},
 })
 
 ----- Tab: Cases -----
 
-local CasesTab = Window:CreateTab({ Name = "Cases", Icon = "package" })
-local OpenBox = CasesTab:CreateGroupbox({ Name = "Auto open", Icon = "zap", Side = "Left" })
-local QueueBox = CasesTab:CreateGroupbox({ Name = "Rotation", Icon = "repeat", Side = "Right" })
+local CasesTab = Window:CreateTab({ Name = "Кейсы", Icon = "package" })
+local OpenBox = CasesTab:CreateGroupbox({ Name = "Автооткрытие", Icon = "zap", Side = "Left" })
+local QueueBox = CasesTab:CreateGroupbox({ Name = "Ротация", Icon = "repeat", Side = "Right" })
 
 OpenBox:CreateParagraph({
-	Title = "How it works",
+	Title = "Как это работает",
 	Content = "The script calls the same Request(\"open\") the case page uses. Without VIP the server takes up to 6 cases per call and needs about a second between calls. Turn AUTO OPEN on and leave it.",
 })
 
 ui.autoOpen = OpenBox:CreateToggle({
-	Name = "Auto open",
-	Desc = "Opens cases in a loop until you stop it",
+	Name = "Автооткрытие",
+	Desc = "Открывает кейсы в цикле, пока вы не остановите его",
 	Flag = "AutoOpen",
 	CurrentValue = false,
 	Callback = function(enabled)
@@ -1313,7 +1313,7 @@ ui.autoOpen = OpenBox:CreateToggle({
 })
 
 ui.casesPerOpen = OpenBox:CreateStepper({
-	Name = "Cases per call",
+	Name = "Кейсов за вызов",
 	Desc = "6 without VIP, 10 with VIP or the preset pass",
 	Range = { 1, 10 },
 	Increment = 1,
@@ -1322,14 +1322,14 @@ ui.casesPerOpen = OpenBox:CreateStepper({
 })
 
 ui.fastMode = OpenBox:CreateToggle({
-	Name = "Fast mode",
+	Name = "Быстрый режим",
 	Desc = "Send turbo = true, the same flag the free fast mode uses",
 	Flag = "FastMode",
 	CurrentValue = true,
 })
 
 ui.reserve = OpenBox:CreateSlider({
-	Name = "Keep credits",
+	Name = "Сохранить кредитов",
 	Desc = "Never spend below this balance (same units as the game)",
 	Range = { 0, 200000 },
 	Increment = 100,
@@ -1339,14 +1339,14 @@ ui.reserve = OpenBox:CreateSlider({
 })
 
 ui.autoSell = OpenBox:CreateToggle({
-	Name = "Auto sell",
+	Name = "Автопродажа",
 	Desc = "Batch sells with the Selling tab filters (see \"Sell every N opens\" there)",
 	Flag = "AutoSell",
 	CurrentValue = Saved.autoSell ~= false,
 })
 
 OpenBox:CreateStatus({
-	Name = "Balance",
+	Name = "Баланс",
 	Style = "Row",
 	Pin = true,
 	UpdateRate = 0.5,
@@ -1356,7 +1356,7 @@ OpenBox:CreateStatus({
 })
 
 OpenBox:CreateStatus({
-	Name = "Opened",
+	Name = "Открыто",
 	Style = "Stat",
 	Update = function()
 		return tostring(State.stats.cases)
@@ -1364,7 +1364,7 @@ OpenBox:CreateStatus({
 })
 
 OpenBox:CreateStatus({
-	Name = "Spent",
+	Name = "Потрачено",
 	Style = "Stat",
 	Update = function()
 		return money(State.stats.invested)
@@ -1372,7 +1372,7 @@ OpenBox:CreateStatus({
 })
 
 OpenBox:CreateStatus({
-	Name = "Earned",
+	Name = "Заработано",
 	Style = "Stat",
 	Update = function()
 		return money(State.stats.earned)
@@ -1380,7 +1380,7 @@ OpenBox:CreateStatus({
 })
 
 OpenBox:CreateStatus({
-	Name = "Profit",
+	Name = "Прибыль",
 	Style = "Stat",
 	Update = function()
 		local profit = State.stats.earned - State.stats.invested
@@ -1392,12 +1392,12 @@ OpenBox:CreateStatus({
 })
 
 QueueBox:CreateParagraph({
-	Title = "Rotation",
+	Title = "Ротация",
 	Content = "Each row opens its case N times, then the script moves to the next row and loops. With rotation off the single case below is used.",
 })
 
 ui.rotateCases = QueueBox:CreateToggle({
-	Name = "Rotate cases",
+	Name = "Ротировать кейсы",
 	Desc = "Walk the queue instead of one case",
 	Flag = "RotateCases",
 	CurrentValue = Saved.rotate ~= false,
@@ -1437,11 +1437,11 @@ do
 end
 
 ui.rotationTable = QueueBox:CreateTable({
-	Name = "Queue",
+	Name = "Очередь",
 	Desc = "Case and how many opens before switching",
 	Columns = {
-		{ Name = "Case", Type = "Dropdown", Options = CaseLabels, Width = 0.66, Searchable = true },
-		{ Name = "Opens", Type = "Number", Min = 1, Max = 9999, Integer = true, Align = "Right", Width = 0.24 },
+		{ Name = "Кейс", Type = "Dropdown", Options = CaseLabels, Width = 0.66, Searchable = true },
+		{ Name = "Открытий", Type = "Number", Min = 1, Max = 9999, Integer = true, Align = "Right", Width = 0.24 },
 	},
 	Rows = queueDefaults,
 	NewRow = function()
@@ -1456,7 +1456,7 @@ ui.rotationTable = QueueBox:CreateTable({
 })
 
 ui.caseDropdown = QueueBox:CreateDropdown({
-	Name = "Single case",
+	Name = "Один кейс",
 	Desc = "Used when rotation is off",
 	Options = CaseLabels,
 	CurrentOption = CaseByLabel[Saved.single] and Saved.single or defaultLabel(),
@@ -1466,7 +1466,7 @@ ui.caseDropdown = QueueBox:CreateDropdown({
 })
 
 QueueBox:CreateStatus({
-	Name = "Now",
+	Name = "Сейчас",
 	Style = "Row",
 	Pin = true,
 	UpdateRate = 0.4,
@@ -1489,7 +1489,7 @@ QueueBox:CreateStatus({
 })
 
 QueueBox:CreateStatus({
-	Name = "Next open",
+	Name = "Следующее открытие",
 	Style = "Row",
 	UpdateRate = 0.3,
 	Update = function()
@@ -1511,7 +1511,7 @@ QueueBox:CreateStatus({
 })
 
 QueueBox:CreateStatus({
-	Name = "Reason",
+	Name = "Причина",
 	Style = "Row",
 	UpdateRate = 0.6,
 	Update = function()
@@ -1523,7 +1523,7 @@ QueueBox:CreateStatus({
 })
 
 QueueBox:CreateStatus({
-	Name = "Last drop",
+	Name = "Последний дроп",
 	Style = "Row",
 	UpdateRate = 0.6,
 	Update = function()
@@ -1538,7 +1538,7 @@ QueueBox:CreateStatus({
 QueueBox:CreateButtonRow({
 	Buttons = {
 		{
-			Name = "Open once",
+			Name = "Открыть один раз",
 			Callback = function()
 				local ok, result = pcall(loopStep)
 				if not ok then
@@ -1547,14 +1547,14 @@ QueueBox:CreateButtonRow({
 			end,
 		},
 		{
-			Name = "Stop",
+			Name = "Стоп",
 			Style = "Danger",
 			Callback = function()
 				stopLoop("manual")
 			end,
 		},
 		{
-			Name = "Reset skips",
+			Name = "Сбросить пропуски",
 			Callback = function()
 				State.skipped = {}
 				State.noFree = {}
@@ -1568,17 +1568,17 @@ QueueBox:CreateButtonRow({
 
 ----- Tab: Selling -----
 
-local SellTab = Window:CreateTab({ Name = "Selling", Icon = "coins" })
-local FilterBox = SellTab:CreateGroupbox({ Name = "Filters", Icon = "sliders-horizontal", Side = "Left" })
-local ActionBox = SellTab:CreateGroupbox({ Name = "Inventory", Icon = "shopping-cart", Side = "Right" })
+local SellTab = Window:CreateTab({ Name = "Продажа", Icon = "coins" })
+local FilterBox = SellTab:CreateGroupbox({ Name = "Фильтры", Icon = "sliders-horizontal", Side = "Left" })
+local ActionBox = SellTab:CreateGroupbox({ Name = "Инвентарь", Icon = "shopping-cart", Side = "Right" })
 
 FilterBox:CreateParagraph({
-	Title = "What gets sold",
+	Title = "Что продаётся",
 	Content = "An item is sold only when it passes every filter: rarity, kind, weapon keyword and the price range. Locked items are never sold.",
 })
 
 ui.rarityDropdown = FilterBox:CreateDropdown({
-	Name = "Rarities",
+	Name = "Редкости",
 	Desc = "Which rarity tiers may be sold",
 	Options = RARITY_OPTIONS,
 	MultipleOptions = true,
@@ -1588,7 +1588,7 @@ ui.rarityDropdown = FilterBox:CreateDropdown({
 })
 
 ui.kindDropdown = FilterBox:CreateDropdown({
-	Name = "Item kinds",
+	Name = "Типы предметов",
 	Desc = "Guns, knives, gloves, agents, stickers, patches, charms, music",
 	Options = KIND_OPTIONS,
 	MultipleOptions = true,
@@ -1598,7 +1598,7 @@ ui.kindDropdown = FilterBox:CreateDropdown({
 })
 
 ui.keywordInput = FilterBox:CreateInput({
-	Name = "Weapon contains",
+	Name = "Ключевое слово в названии",
 	Desc = "Optional, comma separated, matches part of the weapon or item name",
 	PlaceholderText = "ak-47, karambit",
 	CurrentValue = type(Saved.keywords) == "string" and Saved.keywords or "",
@@ -1606,7 +1606,7 @@ ui.keywordInput = FilterBox:CreateInput({
 })
 
 ui.minValue = FilterBox:CreateSlider({
-	Name = "Sell items worth at least",
+	Name = "Продавать от стоимости",
 	Desc = "0 = no lower limit",
 	Range = { 0, 50000 },
 	Increment = 5,
@@ -1616,7 +1616,7 @@ ui.minValue = FilterBox:CreateSlider({
 })
 
 ui.maxValue = FilterBox:CreateSlider({
-	Name = "Keep items worth at least",
+	Name = "Не продавать дороже",
 	Desc = "Anything above this price is never sold",
 	Range = { 0, 300000 },
 	Increment = 50,
@@ -1626,14 +1626,14 @@ ui.maxValue = FilterBox:CreateSlider({
 })
 
 ui.keepLocked = FilterBox:CreateToggle({
-	Name = "Protect locked items",
+	Name = "Защищать заблокированные",
 	Desc = "Items you locked in the game stay in the inventory",
 	Flag = "KeepLocked",
 	CurrentValue = true,
 })
 
 ui.sellEvery = ActionBox:CreateStepper({
-	Name = "Sell every N opens",
+	Name = "Продавать каждые N открытий",
 	Desc = "Selling costs the same server pause as opening, so it runs in batches",
 	Range = { 1, 50 },
 	Increment = 1,
@@ -1642,7 +1642,7 @@ ui.sellEvery = ActionBox:CreateStepper({
 })
 
 ui.forceSellAt = ActionBox:CreateStepper({
-	Name = "Force sell at inventory",
+	Name = "Продавать при заполнении",
 	Desc = "The bag holds " .. tostring(INVENTORY_MAX) .. " items; sell at this fill level",
 	Range = { 100, INVENTORY_MAX },
 	Increment = 10,
@@ -1653,25 +1653,25 @@ ui.forceSellAt = ActionBox:CreateStepper({
 ActionBox:CreateButtonRow({
 	Buttons = {
 		{
-			Name = "Sell now",
+			Name = "Продать сейчас",
 			Style = "Primary",
 			Callback = function()
 				State.selling = false
 				local sold, gained = sellNow("manual")
 				if sold == 0 then
-					notify("Robscript Team - Caser", "Nothing matches the filters", "Warning")
+					notify("Robscript Team - Caser", "Нет предметов по фильтрам", "Warning")
 				elseif sold then
 					notify("Robscript Team - Caser", string.format("Sold %d items for %s", sold, money(gained)), "Success")
 				end
 			end,
 		},
 		{
-			Name = "Refresh",
+			Name = "Обновить",
 			Callback = function()
 				if refreshState() then
 					pushLog("<Muted>profile refreshed</Muted>")
 				else
-					notify("Robscript Team - Caser", "State request failed", "Error")
+					notify("Robscript Team - Caser", "Не удалось получить состояние", "Error")
 				end
 			end,
 		},
@@ -1679,7 +1679,7 @@ ActionBox:CreateButtonRow({
 })
 
 ActionBox:CreateStatus({
-	Name = "Inventory",
+	Name = "Инвентарь",
 	Style = "Row",
 	Pin = true,
 	UpdateRate = 0.5,
@@ -1712,7 +1712,7 @@ ActionBox:CreateStatus({
 })
 
 ActionBox:CreateStatus({
-	Name = "Earned",
+	Name = "Заработано",
 	Style = "Stat",
 	Update = function()
 		return money(State.stats.earned)
@@ -1733,40 +1733,40 @@ ActionBox:CreateStatus({
 
 ----- Tab: Logs -----
 
-local LogTab = Window:CreateTab({ Name = "Logs", Icon = "scroll-text" })
+local LogTab = Window:CreateTab({ Name = "Логи", Icon = "scroll-text" })
 local LogBox = LogTab:CreateGroupbox({ Name = "What the script is doing", Side = "Left" })
 
 LogElement = LogBox:CreateLog({
-	Name = "Activity",
+	Name = "Активность",
 	MaxEntries = 300,
 	MaxRows = 16,
 	Timestamps = true,
-	EmptyText = "Nothing yet",
+	EmptyText = "Пока ничего нет",
 })
 
 ----- Tab: Info -----
 
-local InfoTab = Window:CreateTab({ Name = "Info", Icon = "info" })
-local InfoBox = InfoTab:CreateGroupbox({ Name = "Protocol", Side = "Left" })
-local NumbersBox = InfoTab:CreateGroupbox({ Name = "Session", Side = "Right" })
+local InfoTab = Window:CreateTab({ Name = "Информация", Icon = "info" })
+local InfoBox = InfoTab:CreateGroupbox({ Name = "Протокол", Side = "Left" })
+local NumbersBox = InfoTab:CreateGroupbox({ Name = "Сессия", Side = "Right" })
 
 InfoBox:CreateParagraph({
-	Title = "Open",
+	Title = "Открытие",
 	Content = "Request:InvokeServer(\"open\", { case = id, count = 1..6, turbo = true, free = true }) - the server answers with the dropped items and the fresh profile.",
 })
 
 InfoBox:CreateParagraph({
-	Title = "Sell",
+	Title = "Продажа",
 	Content = "Request:InvokeServer(\"sell\", { ids = { uid, ... } }) - chunked by " .. tostring(SELL_CHUNK) .. " ids per call.",
 })
 
 InfoBox:CreateParagraph({
-	Title = "Limits",
+	Title = "Ограничения",
 	Content = "1..6 cases per call (10 with VIP or the preset pass), about one call per second, " .. tostring(INVENTORY_MAX) .. " inventory slots, the free case needs free opens from rank rewards.",
 })
 
 InfoBox:CreateStatus({
-	Name = "Max per call",
+	Name = "Максимум за вызов",
 	Style = "Row",
 	UpdateRate = 2,
 	Update = function()
@@ -1775,7 +1775,7 @@ InfoBox:CreateStatus({
 })
 
 NumbersBox:CreateStatus({
-	Name = "Calls",
+	Name = "Вызовы",
 	Style = "Row",
 	Update = function()
 		return tostring(State.stats.opens)
@@ -1783,7 +1783,7 @@ NumbersBox:CreateStatus({
 })
 
 NumbersBox:CreateStatus({
-	Name = "Cases",
+	Name = "Кейсы",
 	Style = "Row",
 	Update = function()
 		return tostring(State.stats.cases)
@@ -1791,7 +1791,7 @@ NumbersBox:CreateStatus({
 })
 
 NumbersBox:CreateStatus({
-	Name = "Dropped",
+	Name = "Дропов",
 	Style = "Row",
 	Update = function()
 		return tostring(State.stats.dropped)
@@ -1799,7 +1799,7 @@ NumbersBox:CreateStatus({
 })
 
 NumbersBox:CreateStatus({
-	Name = "Balance",
+	Name = "Баланс",
 	Style = "Row",
 	Pin = true,
 	UpdateRate = 0.5,
@@ -1809,7 +1809,7 @@ NumbersBox:CreateStatus({
 })
 
 NumbersBox:CreateStatus({
-	Name = "Free case opens",
+	Name = "Бесплатные открытия",
 	Style = "Row",
 	Update = function()
 		local map = State.profile and State.profile.freeOpens
@@ -1829,7 +1829,7 @@ NumbersBox:CreateStatus({
 })
 
 NumbersBox:CreateButton({
-	Name = "Destroy hub",
+	Name = "Удалить хаб",
 	Style = "Danger",
 	Callback = function()
 		local api = getgenv().CaserHub
